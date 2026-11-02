@@ -11,7 +11,7 @@ You are a senior full-stack and security engineer. Build the **complete, working
 
 - **Server:** Node.js (LTS) + Express + `ws` (WebSocket) in `/server`.
 - **Client:** a website in `/client` using plain **HTML + CSS + vanilla JavaScript (ES modules), no build step**. The Express server serves `/client` as static files, so the client and server are linked and always on the same origin (no CORS problems).
-- **Database:** `sqlite3` package (NOT `better-sqlite3`), parameterized queries only.
+- **Database:** persist application data in a JSON file (`JSON_DB_PATH`) using atomic writes; a query engine may be used in memory, but do not persist a SQLite database file.
 - **P2P:** WebRTC (RTCDataChannel for messages/files, MediaStream for voice and screen sharing). Free public STUN by default; optional TURN via environment variables (see section 11).
 - **Security libs:** `bcrypt`, `jsonwebtoken`, `helmet`, `express-rate-limit`, `cookie-parser`, `zod` (validation).
 
@@ -163,8 +163,8 @@ Mandatory, verify each item before finishing:
 ## 13. Deployment (Render)
 
 - One Render **Web Service** from the repo root: build `npm install`, start `npm start`; include `render.yaml` and README steps in simple language (Arabic + English).
-- Environment variables: `NODE_ENV=production`, `JWT_SECRET`, `DB_PATH`, optional `TURN_*`.
-- Document that Render's free disk is ephemeral and make `DB_PATH` configurable so a persistent disk can be attached. Add a `/health` endpoint.
+- Environment variables: `NODE_ENV=production`, `JWT_SECRET`, `JSON_DB_PATH`, optional `TURN_*`.
+- Document that Render's free disk is ephemeral and make `JSON_DB_PATH` configurable so a persistent disk can be attached. Document single-instance-only JSON storage. Add a `/health` endpoint.
 - Free instances sleep: the client must auto-reconnect with exponential backoff and show a "server is waking up" message.
 
 ## 14. Testing & Acceptance Checklist

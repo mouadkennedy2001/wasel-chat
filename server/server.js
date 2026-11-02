@@ -7,7 +7,7 @@ const helmet = require("helmet");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const sqlite3 = require("sqlite3").verbose();
+const initSqlJs = require("sql.js");
 const { WebSocketServer, WebSocket } = require("ws");
 const { rateLimit } = require("express-rate-limit");
 const { z } = require("zod");
@@ -55,27 +55,153 @@ function loadConfiguration() {
 
 const JWT_SECRET = loadConfiguration();
 const PORT = Number(process.env.PORT || 3000);
-const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, "chat.sqlite");
-fs.mkdirSync(path.dirname(path.resolve(DB_PATH)), { recursive: true });
+const JSON_DB_PATH = path.resolve(process.env.JSON_DB_PATH || path.join(DATA_DIR, "chat.json"));
+const LEGACY_DB_PATH = path.resolve(process.env.DB_PATH || path.join(DATA_DIR, "chat.sqlite"));
+fs.mkdirSync(path.dirname(JSON_DB_PATH), { recursive: true, mode: 0o700 });
+let db;
 
-const db = new sqlite3.Database(DB_PATH);
-db.configure("busyTimeout", 5000);
-const run = (sql, params = []) => new Promise((resolve, reject) => {
-  db.run(sql, params, function (error) {
-    if (error) reject(error);
-    else resolve({ lastID: this.lastID, changes: this.changes });
-  });
-});
-const get = (sql, params = []) => new Promise((resolve, reject) => {
-  db.get(sql, params, (error, row) => error ? reject(error) : resolve(row));
-});
-const all = (sql, params = []) => new Promise((resolve, reject) => {
-  db.all(sql, params, (error, rows) => error ? reject(error) : resolve(rows));
-});
+function queryAll(sql, params = []) {
+  const statement = db.prepare(sql);
+  try {
+    statement.bind(params);
+    const rows = [];
+    while (statement.step()) rows.push(statement.getAsObject());
+    return rows;
+  } finally {
+    statement.free();
+  }
+}
+
+function persistJsonDatabase() {
+  const schemaObjects = queryAll(
+    "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+  );
+  const tables = {};
+  for (const { name } of schemaObjects.filter((object) => object.type === "table")) {
+    const quotedName = `"${name.replaceAll('"', '""')}"`;
+    tables[name] = {
+      schema: schemaObjects.find((object) => object.type === "table" && object.name === name).sql,
+      columns: queryAll(`PRAGMA table_info(${quotedName})`),
+      rows: queryAll(`SELECT * FROM ${quotedName}`).map((row) =>
+        Object.fromEntries(Object.entries(row).map(([key, value]) => [
+          key,
+          value instanceof Uint8Array
+            ? { $type: "blob", base64: Buffer.from(value).toString("base64") }
+            : value
+        ]))
+      )
+    };
+  }
+  const contents = `${JSON.stringify({
+    format: "wasel-json-db-v1",
+    schema_objects: schemaObjects,
+    tables
+  }, null, 2)}\n`;
+  const temporaryPath = `${JSON_DB_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    const file = fs.openSync(temporaryPath, "r");
+    try {
+      fs.fsyncSync(file);
+    } finally {
+      fs.closeSync(file);
+    }
+    fs.renameSync(temporaryPath, JSON_DB_PATH);
+  } finally {
+    if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
+  }
+}
+
+function importJsonDatabase(state) {
+  if (!state || typeof state !== "object" || !state.tables || typeof state.tables !== "object") {
+    throw new Error("JSON database has an invalid structure.");
+  }
+  const schemaObjects = Array.isArray(state.schema_objects)
+    ? state.schema_objects
+    : Object.entries(state.tables).map(([name, table]) => ({
+      type: "table",
+      name,
+      tbl_name: name,
+      sql: table.schema
+    }));
+  const tableObjects = schemaObjects.filter((object) => object.type === "table" && object.name !== "sqlite_sequence");
+
+  db.run("PRAGMA foreign_keys = OFF");
+  for (const object of tableObjects) {
+    if (typeof object.sql === "string") db.run(object.sql);
+  }
+
+  for (const [name, table] of Object.entries(state.tables)) {
+    if (name === "sqlite_sequence") continue;
+    if (!Array.isArray(table.rows) || !tableObjects.some((object) => object.name === name)) continue;
+    const quotedName = `"${name.replaceAll('"', '""')}"`;
+    for (const row of table.rows) {
+      const columns = Object.keys(row);
+      if (!columns.length) continue;
+      const quotedColumns = columns.map((column) => `"${column.replaceAll('"', '""')}"`).join(",");
+      const placeholders = columns.map(() => "?").join(",");
+      const values = columns.map((column) => {
+        const value = row[column];
+        if (value && value.$type === "blob" && typeof value.base64 === "string") {
+          return Uint8Array.from(Buffer.from(value.base64, "base64"));
+        }
+        return value;
+      });
+      db.run(`INSERT INTO ${quotedName} (${quotedColumns}) VALUES (${placeholders})`, values);
+    }
+  }
+
+  for (const object of schemaObjects.filter((item) =>
+    ["index", "view", "trigger"].includes(item.type) && typeof item.sql === "string"
+  )) {
+    db.run(object.sql);
+  }
+
+  const sequences = state.tables.sqlite_sequence?.rows;
+  if (Array.isArray(sequences) && sequences.length) {
+    db.run("DELETE FROM sqlite_sequence");
+    for (const sequence of sequences) {
+      db.run("INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)", [sequence.name, sequence.seq]);
+    }
+  }
+  db.run("PRAGMA foreign_keys = ON");
+}
+
+async function initializeJsonDatabase() {
+  const SQL = await initSqlJs();
+  db = new SQL.Database();
+  if (!fs.existsSync(JSON_DB_PATH) && fs.existsSync(LEGACY_DB_PATH)) {
+    throw new Error(`Legacy SQLite database found at ${LEGACY_DB_PATH}; export it to JSON and set JSON_DB_PATH before starting.`);
+  }
+  if (fs.existsSync(JSON_DB_PATH)) {
+    let state;
+    try {
+      state = JSON.parse(fs.readFileSync(JSON_DB_PATH, "utf8"));
+    } catch (error) {
+      throw new Error(`Could not read JSON database at ${JSON_DB_PATH}: ${error.message}`);
+    }
+    importJsonDatabase(state);
+  }
+  persistJsonDatabase();
+}
+
+const run = async (sql, params = []) => {
+  try {
+    db.run(sql, params);
+    const changes = db.getRowsModified();
+    const lastID = queryAll("SELECT last_insert_rowid() AS id")[0]?.id || 0;
+    persistJsonDatabase();
+    return { lastID, changes };
+  } catch (error) {
+    if (/constraint failed/i.test(error.message)) error.code = "SQLITE_CONSTRAINT";
+    throw error;
+  }
+};
+const get = async (sql, params = []) => queryAll(sql, params)[0];
+const all = async (sql, params = []) => queryAll(sql, params);
 
 async function initializeDatabase() {
   await run("PRAGMA foreign_keys = ON");
-  await run("PRAGMA journal_mode = WAL");
   await run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL,
@@ -1082,7 +1208,7 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: "INTERNAL_ERROR" });
 });
 
-initializeDatabase().then(() => {
+initializeJsonDatabase().then(() => initializeDatabase()).then(() => {
   server.listen(PORT, () => console.log(`Open http://localhost:${PORT}`));
   const cleanup = setInterval(() => {
     run("DELETE FROM refresh_tokens WHERE expires_at < ? OR revoked_at < ?", [Date.now() - 24 * 60 * 60 * 1000, Date.now() - 30 * 24 * 60 * 60 * 1000])
