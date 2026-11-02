@@ -1,0 +1,27 @@
+{
+  "name": "p2p-chat-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "bcrypt": "6.0.0",
+    "cookie-parser": "1.4.7",
+    "express": "4.22.3",
+    "express-rate-limit": "7.5.0",
+    "helmet": "8.0.0",
+    "jsonwebtoken": "9.0.2",
+    "sqlite3": "6.0.1",
+    "ws": "8.22.1",
+    "zod": "4.6.7"
+  },
+  "overrides": {
+    "minimatch": "11.0.4",
+    "tar": "7.5.22"
+  }
+}
